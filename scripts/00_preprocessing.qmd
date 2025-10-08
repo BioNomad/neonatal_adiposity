@@ -1,0 +1,1113 @@
+---
+title: "Infant Adiposity Differential Expression Analysis"
+author: "Jason Laird"
+date: today 
+date-format: short
+engine: knitr
+execute: 
+  warning: false
+  message: false
+  cache: true
+format: 
+  html:
+    code-fold: true
+    embed-resources: true
+    theme: 
+      - simplex
+      - custom.scss
+    fontcolor: '#0c051a'
+---
+
+## Setup 
+
+### Libraries and Scripts Required
+
+```{r,warning=FALSE, message=FALSE}
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(tidybulk)
+library(openxlsx)
+library(janitor)
+library(ggpubr)
+library(scales)
+library(patchwork)
+library(UpSetR)
+library(SummarizedExperiment)
+library(clusterProfiler)
+library(enrichplot)
+library(EnhancedVolcano)
+library(biomaRt)
+library(factoextra)
+library(FactoMineR)
+library(sva)
+library(GEOquery)
+library(DESeq2)
+library(edgeR)
+library(DEGreport)
+library(impute)
+library(ggsci)
+
+```
+
+## Helper Functions
+
+```{r}
+.get_pairwise_overlaps <- function(sets) {
+  # credit for most of the code:
+  # https://blog.jdblischak.com/posts/pairwise-overlaps/
+  # Ensure that all sets are unique character vectors
+  sets_are_vectors <- vapply(sets, is.vector, logical(1))
+  if (any(!sets_are_vectors)) {
+    stop("Sets must be vectors")
+  }
+  sets_are_atomic <- vapply(sets, is.atomic, logical(1))
+  if (any(!sets_are_atomic)) {
+    stop("Sets must be atomic vectors, i.e. not lists")
+  }
+  sets <- lapply(sets, as.character)
+  is_unique <- function(x) length(unique(x)) == length(x)
+  sets_are_unique <- vapply(sets, is_unique, logical(1))
+  if (any(!sets_are_unique)) {
+    stop("Sets must be unique, i.e. no duplicated elements")
+  }
+
+  n_sets <- length(sets)
+  set_names <- names(sets)
+  n_overlaps <- choose(n = n_sets, k = 2)
+
+  vec_name1 <- character(length = n_overlaps)
+  vec_name2 <- character(length = n_overlaps)
+  vec_num_shared <- integer(length = n_overlaps)
+  vec_overlap <- numeric(length = n_overlaps)
+  vec_jaccard <- numeric(length = n_overlaps)
+  vec_shared_terms <- character(length = n_overlaps)
+  overlaps_index <- 1
+
+  for (i in seq_len(n_sets - 1)) {
+    name1 <- set_names[i]
+    set1 <- sets[[i]]
+    for (j in seq(i + 1, n_sets)) {
+      name2 <- set_names[j]
+      set2 <- sets[[j]]
+
+      shared_terms <- paste(Reduce(intersect,list(set1,set2)),collapse = ",")
+
+      set_intersect <- set1[match(set2, set1, 0L)]
+      set_union <- .Internal(unique(c(set1, set2), incomparables = FALSE,
+                                    fromLast = FALSE, nmax = NA))
+      num_shared <- length(set_intersect)
+      overlap <- num_shared / min(length(set1), length(set2))
+      jaccard <- num_shared / length(set_union)
+
+      vec_name1[overlaps_index] <- name1
+      vec_name2[overlaps_index] <- name2
+      vec_num_shared[overlaps_index] <- num_shared
+      vec_overlap[overlaps_index] <- overlap
+      vec_jaccard[overlaps_index] <- jaccard
+      vec_shared_terms[overlaps_index] <- shared_terms
+
+      overlaps_index <- overlaps_index + 1
+    }
+  }
+
+  result <- data.frame(source = vec_name1,
+                       target = vec_name2,
+                       num_shared = vec_num_shared,
+                       overlap = vec_overlap,
+                       jaccard = vec_jaccard,
+                       shared_terms = vec_shared_terms,
+                       stringsAsFactors = FALSE)
+  return(result)
+}
+
+.cluster_mat <- function(
+    data_matrix,
+    dist_method = NULL,
+    cluster_method = "ward.D",
+    clustering_approach = "gap",
+    gap_stat_k_max = 20,
+    gap_stat_B = 50,
+    density_quantile = 0.90) {
+
+  # Determine appropriate distance metric
+  if (is.null(dist_method)) {
+    if (all(sapply(data_matrix, is.numeric))) {
+      dist_method <- "euclidean"
+    } else {
+      dist_method <- "gower"
+    }
+  }
+
+  # Compute distance matrix
+  sample_dist <- if (dist_method == "gower") {
+    cluster::daisy(data_matrix, metric = "gower")
+  } else {
+    dist(data_matrix, method = dist_method)
+  }
+
+  # Function to determine optimal k based on the selected clustering approach
+  determine_k <- function(dist_matrix, cluster_method) {
+    if (clustering_approach == "diana") {
+
+      # Determine optimal k using the height difference method
+      sample_cluster <- cluster::diana(as.dist(dist_matrix))
+      height_diffs <- diff(sample_cluster$height)
+      cutoff_index <- which.max(height_diffs)
+      return(length(sample_cluster$height) - cutoff_index)
+
+    } else if (clustering_approach == "gap") {
+
+      # Determine optimal k using the gap statistic
+      gap_stat <- cluster::clusGap(as.matrix(dist_matrix), FUN = hcut, K.max = gap_stat_k_max, B = gap_stat_B)
+      return(cluster::maxSE(gap_stat$Tab[, "gap"], gap_stat$Tab[, "SE.sim"]))
+
+    } else if (clustering_approach == "elbow") {
+
+      # Determine optimal k using the elbow method
+      wss_plot <- factoextra::fviz_nbclust(as.matrix(dist_matrix), FUN = hcut, method = "wss")
+
+      # Identify the first significant drop and ensure it's a number we can use
+      k_optimal <- which.min(diff(diff(wss_plot$data$y))) + 1
+      if (is.na(k_optimal) || k_optimal < 2) k_optimal <- 3
+      return(k_optimal)
+
+    } else if (clustering_approach == "dynamic") {
+
+    # Determine optimal k using dynamic tree cut
+     sample_cluster <- hclust(as.dist(dist_matrix), method = cluster_method)
+      cut_clusters <- dynamicTreeCut::cutreeDynamic(
+        dendro = sample_cluster,
+        distM = as.matrix(as.dist(dist_matrix)),
+        deepSplit = 2)
+      return(length(unique(cut_clusters)))
+
+    } else if (clustering_approach == "density") {
+      # Determine optimal k using density-based clustering
+      dclust <- densityClust::densityClust(as.dist(dist_matrix), gaussian = TRUE)
+      dclust <- densityClust::findClusters(dclust, rho = quantile(dclust$rho, density_quantile), delta = quantile(dclust$delta, density_quantile))
+      return(length(unique(dclust$clusters)))
+
+    } else {
+      stop("Invalid clustering approach selected.")
+    }
+  }
+
+  k_samples <- determine_k(sample_dist, cluster_method)
+
+  # Perform hierarchical clustering only if needed
+  sample_cluster <- hclust(as.dist(sample_dist), method = cluster_method)
+
+  # Cut dendrograms using optimal k values
+  sample_groups <- cutree(sample_cluster, k = k_samples)
+
+  message("Optimal number of clusters for samples: ", k_samples)
+
+  return(sample_groups)
+}
+```
+
+
+### Import Data
+
+
+
+```{r,warning=FALSE, message=FALSE}
+# import count data
+counts <- read.csv(
+  file = "../../data/tufts_gene_featurecounts.tsv",sep="\t")
+
+# clean up expression data
+exp <- counts |>  
+  column_to_rownames("Geneid") |>
+  dplyr::select(-c(gene_type,Length)) |> 
+  (\(df) {colnames(df)=gsub("X","s",colnames(df));df})()
+
+# convert to integer values
+exp <- exp |> 
+  mutate_all(as.integer)
+
+# separate out feature data
+features <- counts |> 
+  dplyr::select(Geneid,Length,gene_type) |> 
+  (\(df){rownames(df)=df$Geneid;df})() 
+
+# import metadata
+meta <- read.csv("../../data/tigor_pilot_clinical.csv") |> 
+  mutate(id=paste0("s",Study.id)) |> 
+  column_to_rownames("id") |> 
+  mutate(mfadip=paste(madip,fadip,sep="_"))
+
+# ensure sample order and feature order matches 
+meta <-  meta[match(colnames(exp), rownames(meta)),]
+
+# ensure all samples in metadata are in expression data
+stopifnot(all(colnames(exp)==rownames(meta)))
+
+# ensure feature order matches expression data
+stopifnot(all(rownames(features)==rownames(exp)))
+```
+
+
+### Create Summarized Experiment Object
+
+```{r,warning=FALSE, message=FALSE}
+# create SummarizedExperiment object
+se <- SummarizedExperiment(assays = list(
+  counts = as.matrix(exp)), 
+  colData = meta, 
+  rowData = features)
+
+# Keep only protein coding genes
+se_filt <- se |> 
+  (\(se){se=se[
+    rownames(se) %in% 
+      features$Geneid[
+        features$gene_type == "protein_coding"],]})()
+
+
+# filter out outliers
+se_filt <- se_filt[,!colnames(se_filt) %in% c("s34", "s459", "s29", "s72", "s307", "s349")]
+```
+
+## PCA Analysis
+
+Filtering to the protein coding genes does appear to resolve expression variation by sex.
+
+```{r,warning=FALSE, message=FALSE}
+#| fig-width: 4
+#| fig-height: 3
+
+se_filt <- se_filt |> 
+  reduce_dimensions(method="PCA",
+                    .dims = 6)
+  
+```
+
+::: panel-tabset
+
+### PCA By Sex
+
+```{r,warning=FALSE, message=FALSE}
+#| fig-width: 4.5
+#| fig-height: 4
+
+
+# plot PCA
+se_filt |> 
+  pivot_sample() |> 
+  ggplot(aes(PC1, PC2, color = gender)) +
+  geom_point()+
+  theme_pubr(legend="right")+
+  scale_color_npg()
+```
+
+### PCA By Race
+
+```{r,warning=FALSE, message=FALSE}
+#| fig-width: 4.5
+#| fig-height: 4
+
+
+# plot PCA
+se_filt |> 
+  pivot_sample() |> 
+  ggplot(aes(PC1, PC2, color = race)) +
+  geom_point()+
+  theme_pubr(legend="right")+
+  scale_color_npg()
+```
+
+
+### PCA By Fetal Adiposity
+
+```{r,warning=FALSE, message=FALSE}
+#| fig-width: 4.5
+#| fig-height: 4
+# plot PCA
+se_filt |> 
+  pivot_sample() |> 
+  ggplot(aes(PC1, PC2, color = fadip)) +
+  geom_point()+
+  theme_pubr(legend="right")+
+  scale_color_npg()
+```
+
+### PCA By Maternal Adiposity
+
+```{r,warning=FALSE, message=FALSE}
+#| fig-width: 4.5
+#| fig-height: 4
+
+# plot PCA
+se_filt |> 
+  pivot_sample() |> 
+  ggplot(aes(PC1, PC2, color = madip)) +
+  geom_point()+
+  theme_pubr(legend="right")+
+  scale_color_npg()
+```
+
+### PCA By Maternal/Fetal Adiposity
+
+```{r,warning=FALSE, message=FALSE}
+#| fig-width: 4.5
+#| fig-height: 4
+
+# plot PCA
+se_filt |> 
+  pivot_sample() |> 
+  ggplot(aes(PC1, PC2, color = mfadip)) +
+  geom_point()+
+  theme_pubr(legend="right")+
+  scale_color_npg()
+```
+
+:::
+
+
+## Differential Expression Analysis
+
+### Lean Mothers
+
+```{r,warning=FALSE, message=FALSE}
+# perform differential expression using DESeq2
+lean_deg <- se_filt |> 
+  (\(se) {se = se[,grepl("Lean",se$mfadip)];se})() |> 
+  (\(se) {se$mfadip = factor(se$mfadip,levels=c("Lean_LA","Lean_HA"));se})() |> 
+  test_differential_abundance( ~ mfadip,
+                               method="deseq2",
+                               fitType="local",
+                               action="get") |>
+  as.data.frame() |> 
+  mutate(direction = ifelse( log2FoldChange > 0,"Up","Down"))
+
+```
+
+
+### Lean Mothers + Sex Adjustment
+
+```{r,warning=FALSE, message=FALSE}
+# perform differential expression using DESeq2
+lean_sex_adj_deg <- se_filt |> 
+  (\(se) {se = se[,grepl("Lean",se$mfadip)];se})() |> 
+  (\(se) {se$mfadip = factor(se$mfadip,levels=c("Lean_LA","Lean_HA"));se})() |> 
+  test_differential_abundance( ~ mfadip + gender,
+                               method="deseq2",
+                               fitType="local",
+                               action="get") |>
+  as.data.frame() |> 
+  mutate(direction = ifelse( log2FoldChange > 0,"Up","Down"))
+
+```
+
+
+
+### Obese Mothers
+
+```{r,warning=FALSE, message=FALSE}
+# perform differential expression using DESeq2
+obese_deg <- se_filt |> 
+  (\(se) {se = se[,grepl("Obese",se$mfadip)];se})() |> 
+  (\(se) {se$mfadip = factor(se$mfadip,levels=c("Obese_LA","Obese_HA"));se})() |> 
+  test_differential_abundance( ~ mfadip,
+                               method="deseq2",
+                               fitType="local",
+                               action="get") |>
+  as.data.frame() |> 
+  mutate(direction = ifelse( log2FoldChange > 0,"Up","Down"))
+
+```
+
+
+### Obese Mothers + Sex Adjustment
+
+```{r,warning=FALSE, message=FALSE}
+# perform differential expression using DESeq2
+obese_sex_adj_deg <- se_filt |> 
+  (\(se) {se = se[,grepl("Obese",se$mfadip)];se})() |> 
+  (\(se) {se$mfadip = factor(se$mfadip,levels=c("Obese_LA","Obese_HA"));se})() |> 
+  test_differential_abundance( ~ mfadip + gender,
+                               method="deseq2",
+                               fitType="local",
+                               action="get") |>
+  as.data.frame() |> 
+  mutate(direction = ifelse( log2FoldChange > 0,"Up","Down"))
+
+```
+
+### Overlap of DEGs
+
+There are more DEGs in the obese group compared to the lean group. Aside from the 23 genes shared by all comparisons, the transcriptional profiles of the placentas in obese and lean mothers is quite different.
+
+```{r,warning=FALSE, message=FALSE}
+#| fig-width: 7
+#| fig-height: 4
+
+deg_df <- list(
+  "Lean" = lean_deg |> 
+    filter(pvalue < 0.05 & abs(log2FoldChange) > log2(1.5)) |> 
+    rownames_to_column("gene"),
+  "Lean Sex Adj" = lean_sex_adj_deg |> 
+    filter(pvalue < 0.05 & abs(log2FoldChange) > log2(1.5))|> 
+    rownames_to_column("gene"),
+  "Obese" = obese_deg |> 
+    filter(pvalue < 0.05 & abs(log2FoldChange) > log2(1.5))|> 
+    rownames_to_column("gene"),
+  "Obese Sex Adj" = obese_sex_adj_deg |> 
+    filter(pvalue < 0.05 & abs(log2FoldChange) > log2(1.5))|> 
+    rownames_to_column("gene")
+) |> 
+  bind_rows(.id="group")
+
+deg_lst <- deg_df |> 
+  (\(df) split(df,df$group))() |> 
+  lapply(\(df){df$gene})
+
+# upset plot
+upset(fromList(deg_lst),nsets = 100,nintersects = 100)
+```
+
+## DEG Data - Sex Adj.
+
+```{r,warning=FALSE, message=FALSE}
+common_degs <- Reduce(
+  intersect,
+  deg_lst[names(deg_lst) %in% c(
+    "Lean Sex Adj","Obese Sex Adj")] )
+
+DT::datatable(deg_df |> 
+                filter(group %in% c(
+                  "Lean Sex Adj","Obese Sex Adj")) |> 
+                filter(gene %in% common_degs),
+              extensions = 'Buttons', 
+              options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+  )
+)
+```
+
+## DEG Data - Directionality
+
+About 2/3 of the adjusted DEGs are concordant in directionality between the lean and obese mothers. 
+
+```{r,warning=FALSE, message=FALSE}
+DT::datatable(
+  deg_df |> 
+    filter(group %in% c(
+        "Lean Sex Adj",
+        "Obese Sex Adj")) |> 
+    filter(gene %in% common_degs) |> 
+  group_by(gene) |> summarise(
+    direction_lean=direction[grepl("Lean",group)],
+    direction_obese=direction[grepl("Obese",group)]) |>
+  ungroup() |> 
+  mutate(concordance=case_when(
+    direction_lean==direction_obese ~ "same",
+    direction_lean!=direction_obese ~ "different")) ,
+  extensions = 'Buttons', 
+              options = list(
+    dom = 'Bfrtip',
+    buttons = c('copy', 'csv', 'excel', 'pdf', 'print')
+  )
+)
+```
+
+## Key CNAAGs of Interest
+
+These genes caught my eye, it looks like there is a downregulation of immunoregulatory genes (HLA-G) and an upregulation of innate immune genes, particularly those associated with neutrophil activity.
+
+
+```{r,warning=FALSE, message=FALSE,fig.width=8, fig.height=4}
+se_filt |> 
+  scale_abundance(method = "TMM") |> 
+  adjust_abundance(
+    .factor_unwanted = gender,
+    .factor_of_interest = mfadip, 
+    method="combat"	) |>  
+  tidybulk() |> 
+  filter(.feature %in% c("HLA-G","IL20","MPO","DEFA1","DEFA1B")) |> 
+  mutate(.feature=factor(.feature,
+                        levels=c("HLA-G","IL20","MPO","DEFA1","DEFA1B"))) |>
+  mutate(madip=case_when(
+    madip=="Lean" ~ "Lean Mother",
+    madip=="Obese" ~ "Obese Mother"
+  )) |> 
+  mutate(fadip=case_when(
+    fadip=="LA" ~ "Low Adiposity Infant",
+    fadip=="HA" ~ "High Adiposity Infant"
+  )) |> 
+  mutate(fadip = factor(
+    fadip, 
+    levels = c("Low Adiposity Infant",
+               "High Adiposity Infant"))) |> 
+  ggplot(aes(x = mfadip, 
+             y = log2(counts_scaled_adjusted  +1),
+             color = fadip,
+             fill = fadip)) +
+  geom_violin(alpha=0.5) +
+  geom_jitter(alpha=0.1) +
+  ggpubr::geom_pwc(
+    aes(group=fadip),
+    label = "{p.format}{p.signif}",
+    method = "t.test"
+  )+
+  theme_minimal()+
+  facet_grid(~.feature,
+             scales = "free",
+             space = "free")+
+  ggpubr::rotate_x_text(angle = 45)+
+  stat_summary(fun = mean)+
+  scale_fill_lancet()+
+  scale_color_lancet()+
+  scale_y_continuous(expand=c(0,1))+
+  labs(x = "",
+       y = expression(Log[2]*"(Exp)"),
+       fill = "",
+       color = "")+
+  theme(legend.position = "right",
+        strip.text.x = element_text(face = "bold.italic"))
+```
+## Cytotoxic Genes
+
+Broadly innate and adaptive cytotoxic genes appear downregulated in the placentas of lean mothers with high adiposity infants, while the obese mothers have upregulation of these genes. 
+
+```{r,warning=FALSE, message=FALSE,fig.width=10, fig.height=5}
+se_filt |> 
+    scale_abundance(method = "TMM") |> 
+    adjust_abundance(
+        .factor_unwanted = gender,
+        .factor_of_interest = mfadip, 
+        method="combat"	) |>  
+    tidybulk() |> 
+    filter(.feature %in% c(
+      # Granzymes
+  "GZMA", "GZMB", "GZMH", "GZMK", "GZMM",
+  
+  # Perforin
+  "PRF1"
+
+    )) |> 
+    mutate(madip=case_when(
+        madip=="Lean" ~ "Lean Mother",
+        madip=="Obese" ~ "Obese Mother"
+    )) |> 
+    mutate(fadip=case_when(
+        fadip=="LA" ~ "Low Adiposity Infant",
+        fadip=="HA" ~ "High Adiposity Infant"
+    )) |> 
+    mutate(fadip = factor(
+        fadip, 
+        levels = c("Low Adiposity Infant",
+                   "High Adiposity Infant"))) |> 
+    ggplot(aes(x = mfadip, 
+               y = log2(counts_scaled_adjusted  +1),
+               color = fadip,
+               fill = fadip)) +
+    geom_violin(alpha=0.5) +
+    geom_jitter(alpha=0.1) +
+    ggpubr::geom_pwc(
+        aes(group=fadip),
+        label = "{p.format}{p.signif}",
+        method = "t.test"
+    )+
+    theme_minimal()+
+    facet_grid(~.feature,
+               scales = "free",
+               space = "free")+
+    ggpubr::rotate_x_text(angle = 45)+
+    stat_summary(fun = mean)+
+    scale_fill_lancet()+
+    scale_color_lancet()+
+    scale_y_continuous(expand=c(0,1))+
+    labs(x = "",
+         y = expression(Log[2]*"(Exp)"),
+         fill = "",
+         color = "")+
+    theme(legend.position = "right",
+          strip.text.x = element_text(face = "bold.italic"))
+
+```
+
+
+```{r,warning=FALSE, message=FALSE,fig.width=12, fig.height=5}
+se_filt |> 
+    scale_abundance(method = "TMM") |> 
+    adjust_abundance(
+        .factor_unwanted = gender,
+        .factor_of_interest = mfadip, 
+        method="combat"	) |>  
+    tidybulk() |> 
+    filter(.feature %in% c(
+  
+  # Cytotoxic cytokines
+  "IFNG", "TNF", "FASLG",
+
+  # Cytotoxic effector receptors
+  "KLRD1", "KLRK1", "KLRC1", "NKG7"
+    )) |> 
+    mutate(madip=case_when(
+        madip=="Lean" ~ "Lean Mother",
+        madip=="Obese" ~ "Obese Mother"
+    )) |> 
+    mutate(fadip=case_when(
+        fadip=="LA" ~ "Low Adiposity Infant",
+        fadip=="HA" ~ "High Adiposity Infant"
+    )) |> 
+    mutate(fadip = factor(
+        fadip, 
+        levels = c("Low Adiposity Infant",
+                   "High Adiposity Infant"))) |> 
+    ggplot(aes(x = mfadip, 
+               y = log2(counts_scaled_adjusted  +1),
+               color = fadip,
+               fill = fadip)) +
+    geom_violin(alpha=0.5) +
+    geom_jitter(alpha=0.1) +
+    ggpubr::geom_pwc(
+        aes(group=fadip),
+        label = "{p.format}{p.signif}",
+        method = "t.test"
+    )+
+    theme_minimal()+
+    facet_grid(~.feature,
+               scales = "free",
+               space = "free")+
+    ggpubr::rotate_x_text(angle = 45)+
+    stat_summary(fun = mean)+
+    scale_fill_lancet()+
+    scale_color_lancet()+
+    scale_y_continuous(expand=c(0,1))+
+    labs(x = "",
+         y = expression(Log[2]*"(Exp)"),
+         fill = "",
+         color = "")+
+    theme(legend.position = "right",
+          strip.text.x = element_text(face = "bold.italic"))
+
+```
+
+
+```{r,warning=FALSE, message=FALSE,fig.width=10, fig.height=5}
+se_filt |> 
+    scale_abundance(method = "TMM") |> 
+    adjust_abundance(
+        .factor_unwanted = gender,
+        .factor_of_interest = mfadip, 
+        method="combat"	) |>  
+    tidybulk() |> 
+    filter(.feature %in% c(
+  # Co-stimulatory/activation
+  "CD8A", "CD8B", "CD244", "CRTAM",
+  
+  # Transcriptional regulators
+  "EOMES", "TBX21" 
+    )) |> 
+    mutate(madip=case_when(
+        madip=="Lean" ~ "Lean Mother",
+        madip=="Obese" ~ "Obese Mother"
+    )) |> 
+    mutate(fadip=case_when(
+        fadip=="LA" ~ "Low Adiposity Infant",
+        fadip=="HA" ~ "High Adiposity Infant"
+    )) |> 
+    mutate(fadip = factor(
+        fadip, 
+        levels = c("Low Adiposity Infant",
+                   "High Adiposity Infant"))) |> 
+    ggplot(aes(x = mfadip, 
+               y = log2(counts_scaled_adjusted  +1),
+               color = fadip,
+               fill = fadip)) +
+    geom_violin(alpha=0.5) +
+    geom_jitter(alpha=0.1) +
+    ggpubr::geom_pwc(
+        aes(group=fadip),
+        label = "{p.format}{p.signif}",
+        method = "t.test"
+    )+
+    theme_minimal()+
+    facet_grid(~.feature,
+               scales = "free",
+               space = "free")+
+    ggpubr::rotate_x_text(angle = 45)+
+    stat_summary(fun = mean)+
+    scale_fill_lancet()+
+    scale_color_lancet()+
+    scale_y_continuous(expand=c(0,1))+
+    labs(x = "",
+         y = expression(Log[2]*"(Exp)"),
+         fill = "",
+         color = "")+
+    theme(legend.position = "right",
+          strip.text.x = element_text(face = "bold.italic"))
+
+```
+
+
+## Immunoregulatory Genes
+
+It looks like the Lean mother placentas of high adiposity infants have reduced expression of immunoregulatory genes, while the obese mothers have increased expression of these genes. This is consistent with the idea that the placentas of obese mothers are more inflammatory.
+
+```{r,warning=FALSE, message=FALSE,fig.width=10, fig.height=5}
+
+se_filt |> 
+    scale_abundance(method = "TMM") |> 
+    adjust_abundance(
+        .factor_unwanted = gender,
+        .factor_of_interest = mfadip, 
+        method="combat"	) |>  
+    tidybulk() |> 
+    filter(.feature %in% c("FOXP3", "IL10", "TGFB1", "PDCD1", "CTLA4", "LAG3", "TIGIT")) |> 
+    mutate(madip=case_when(
+        madip=="Lean" ~ "Lean Mother",
+        madip=="Obese" ~ "Obese Mother"
+    )) |> 
+    mutate(fadip=case_when(
+        fadip=="LA" ~ "Low Adiposity Infant",
+        fadip=="HA" ~ "High Adiposity Infant"
+    )) |> 
+    mutate(fadip = factor(
+        fadip, 
+        levels = c("Low Adiposity Infant",
+                   "High Adiposity Infant"))) |> 
+    ggplot(aes(x = mfadip, 
+               y = log2(counts_scaled_adjusted  +1),
+               color = fadip,
+               fill = fadip)) +
+    geom_violin(alpha=0.5) +
+    geom_jitter(alpha=0.1) +
+    ggpubr::geom_pwc(
+        aes(group=fadip),
+        label = "{p.format}{p.signif}",
+        method = "t.test"
+    )+
+    theme_minimal()+
+    facet_grid(~.feature,
+               scales = "free",
+               space = "free")+
+    ggpubr::rotate_x_text(angle = 45)+
+    stat_summary(fun = mean)+
+    scale_fill_lancet()+
+    scale_color_lancet()+
+    scale_y_continuous(expand=c(0,1))+
+    labs(x = "",
+         y = expression(Log[2]*"(Exp)"),
+         fill = "",
+         color = "")+
+    theme(legend.position = "right",
+          strip.text.x = element_text(face = "bold.italic"))
+```
+
+
+## Adipocyte Differentiation
+
+Aside for LEP in obese mothers with high adiposity infants, the adipocyte differentiation genes are not differentially expressed. 
+
+```{r,warning=FALSE, message=FALSE,fig.width=10, fig.height=4}
+se_filt |> 
+    scale_abundance(method = "TMM") |> 
+    adjust_abundance(
+        .factor_unwanted = gender,
+        .factor_of_interest = mfadip, 
+        method="combat"	) |>  
+    tidybulk() |> 
+    filter(.feature %in% c("PPARG", "CEBPA", "CEBPD", "FABP4", "SCD1", "ADIPOQ", "LEP")) |> 
+    mutate(madip=case_when(
+        madip=="Lean" ~ "Lean Mother",
+        madip=="Obese" ~ "Obese Mother"
+    )) |> 
+    mutate(fadip=case_when(
+        fadip=="LA" ~ "Low Adiposity Infant",
+        fadip=="HA" ~ "High Adiposity Infant"
+    )) |> 
+    mutate(fadip = factor(
+        fadip, 
+        levels = c("Low Adiposity Infant",
+                   "High Adiposity Infant"))) |> 
+    ggplot(aes(x = mfadip, 
+               y = log2(counts_scaled_adjusted  +1),
+               color = fadip,
+               fill = fadip)) +
+    geom_violin(alpha=0.5) +
+    geom_jitter(alpha=0.1) +
+    ggpubr::geom_pwc(
+        aes(group=fadip),
+        label = "{p.format}{p.signif}",
+        method = "t.test"
+    )+
+    theme_minimal()+
+    facet_grid(~.feature,
+               scales = "free",
+               space = "free")+
+    ggpubr::rotate_x_text(angle = 45)+
+    stat_summary(fun = mean)+
+    scale_fill_lancet()+
+    scale_color_lancet()+
+    scale_y_continuous(expand=c(0,1))+
+    labs(x = "",
+         y = expression(Log[2]*"(Exp)"),
+         fill = "",
+         color = "")+
+    theme(legend.position = "right",
+          strip.text.x = element_text(face = "bold.italic"))
+```
+
+## Nutrient Signaling
+
+There is limited upregulation of nutrient signaling genes. However, GLUT4 and IGF signaling are upregulated in both lean and obese mothers with high adiposity infants.
+
+```{r,warning=FALSE, message=FALSE,fig.width=14, fig.height=5}
+se_filt |> 
+    scale_abundance(method = "TMM") |> 
+    adjust_abundance(
+        .factor_unwanted = gender,
+        .factor_of_interest = mfadip, 
+        method="combat"	) |>  
+    tidybulk() |> 
+    filter(.feature %in% c( "INSR", "IGF1", "IGF1R", "IRS1", "IRS2", "AKT1", "AKT2","SLC2A4", "MTOR", "RPTOR")) |> 
+    mutate(madip=case_when(
+        madip=="Lean" ~ "Lean Mother",
+        madip=="Obese" ~ "Obese Mother"
+    )) |> 
+    mutate(fadip=case_when(
+        fadip=="LA" ~ "Low Adiposity Infant",
+        fadip=="HA" ~ "High Adiposity Infant"
+    )) |> 
+    mutate(fadip = factor(
+        fadip, 
+        levels = c("Low Adiposity Infant",
+                   "High Adiposity Infant"))) |> 
+    ggplot(aes(x = mfadip, 
+               y = log2(counts_scaled_adjusted  +1),
+               color = fadip,
+               fill = fadip)) +
+    geom_violin(alpha=0.5) +
+    geom_jitter(alpha=0.1) +
+    ggpubr::geom_pwc(
+        aes(group=fadip),
+        label = "{p.format}{p.signif}",
+        method = "t.test"
+    )+
+    theme_minimal()+
+    facet_grid(~.feature,
+               scales = "free",
+               space = "free")+
+    ggpubr::rotate_x_text(angle = 45)+
+    stat_summary(fun = mean)+
+    scale_fill_lancet()+
+    scale_color_lancet()+
+    scale_y_continuous(expand=c(0,1))+
+    labs(x = "",
+         y = expression(Log[2]*"(Exp)"),
+         fill = "",
+         color = "")+
+    theme(legend.position = "right",
+          strip.text.x = element_text(face = "bold.italic"))
+```
+
+
+
+## Enrichment Analysis
+
+```{r,warning=FALSE, message=FALSE}
+enrich_res <- compareCluster(
+        gene~direction+group,
+        data = deg_df,
+        fun = "enrichGO",
+        OrgDb = 'org.Hs.eg.db',
+        keyType = "SYMBOL",
+        ont = "BP",
+        universe = rownames(se_filt),
+        pAdjustMethod = "fdr",
+        pvalueCutoff = 0.1,
+        qvalueCutoff = 0.1
+      )
+
+overlaps <- .get_pairwise_overlaps(
+  sets = enrich_res@compareClusterResult |> 
+    filter(p.adjust < 0.1) |> 
+    (\(df) split(df,df$Description))() |> 
+    map(~ .x |> 
+          pull(geneID) |> 
+          strsplit(split = "/") |> 
+          unlist() |> 
+          unique()
+    )
+)
+
+
+overlap_mat <- overlaps |> 
+  dplyr::select(source,target,jaccard) |> 
+  pivot_wider(
+    names_from = target,
+    values_from = jaccard,
+    values_fill = 0
+  ) |> 
+  column_to_rownames("source") |> 
+  as.matrix()
+
+groups <- .cluster_mat(
+  overlap_mat,
+  clustering_approach = "diana") |> 
+  as.data.frame() |> 
+  setNames("go_group") |>
+  rownames_to_column("Description")
+
+
+enrich_res_mapped <- enrich_res |> 
+  pluck("compareClusterResult") |> 
+  left_join(groups, by = "Description") |> 
+  mutate(go_group=paste("Group",go_group,sep=" ")) 
+```
+
+```{r,warning=FALSE, message=FALSE}
+lean_terms <- enrich_res@compareClusterResult |> 
+  filter(grepl("Lean",group)) |> 
+  filter(p.adjust < 0.1) |> 
+  pull(Description)
+
+obese_terms <- enrich_res@compareClusterResult |> 
+  filter(grepl("Obese",group)) |> 
+  filter(p.adjust < 0.1) |> 
+  pull(Description)
+
+common_terms <- intersect(lean_terms,obese_terms)
+```
+
+
+### DotPlot - All Groups
+
+The dotplot below shows that the DEGs from the lean mothers are enriched for terms related to T cell activation and differentiation, specifically downregulation of these. The obese mothers have a large set of DEGs but don't seem to converge on a biological process.
+
+```{r,warning=FALSE, message=FALSE,fig.width=10, fig.height=20}
+enrich_res_mapped |> 
+  #filter(grepl("Down",direction)) |>
+  arrange(go_group, p.adjust) |> 
+  group_by(go_group,Cluster) |> 
+  slice_head(n=5) |> 
+  ungroup() |> 
+  ggplot(aes(
+    y = fct_reorder(Description, -log10(p.adjust)),
+    x = group,
+    color = -log10(pvalue),
+    size = Count
+  )) +
+  geom_point() +
+  theme_pubr() +
+  theme(legend.position = "right") +
+  rotate_x_text(angle = 45) +
+  facet_grid(go_group ~ direction, scales = "free",space = "free") +
+  scale_color_gradient(low="#feb7d2",high = "#870234")+
+  theme(strip.text.y = element_text(face = "bold.italic",angle = 0),
+        strip.text.x = element_text(face = "bold.italic"),
+        plot.title = element_text(face = "bold.italic"),
+        plot.subtitle = element_text(face = "italic")) +
+  labs(
+    x = "",
+    y = "",
+    color = expression("Log"[10]*"(p-value)"),
+    size = "Count",
+    title = "DotPlot of Enriched Terms",
+    subtitle = "Direction refers to state of high adiposity infants"
+  )
+```
+
+### DotPlot - Lean Mothers
+
+Again, broad downregulation of T cell activation and differentiation genes, as well as chemotaxis and cytotoxicity.
+
+```{r,warning=FALSE, message=FALSE,fig.width=9, fig.height=16}
+enrich_res_mapped |> 
+  filter(grepl("Lean",Cluster)) |>
+  arrange(go_group, p.adjust) |> 
+  group_by(go_group,Cluster) |> 
+  slice_head(n=5) |> 
+  ungroup() |> 
+  ggplot(aes(
+    y = fct_reorder(Description, -log10(p.adjust)),
+    x = group,
+    color = -log10(pvalue),
+    size = Count
+  )) +
+  geom_point() +
+  theme_pubr() +
+  theme(legend.position = "right") +
+  rotate_x_text(angle = 45) +
+  facet_grid(go_group ~ direction, scales = "free",space = "free") +
+  scale_color_gradient(low="#feb7d2",high = "#870234")+
+  theme(strip.text.y = element_text(face = "bold.italic",angle = 0),
+        strip.text.x = element_text(face = "bold.italic"),
+        plot.title = element_text(face = "bold.italic"),
+        plot.subtitle = element_text(face = "italic")) +
+  labs(
+    x = "",
+    y = "",
+    color = expression("Log"[10]*"(p-value)"),
+    size = "Count",
+    title = "DotPlot of Enriched Terms",
+    subtitle = "Direction refers to state of high adiposity infants"
+  )
+```
+
+### DotPlot - Obese Mothers
+
+Closer inspection shows that there is a broad upregulation of innate and adaptive response genes.
+
+```{r,warning=FALSE, message=FALSE,fig.width=10, fig.height=8}
+
+enrich_res_mapped |> 
+  filter(grepl("Obese",Cluster)) |>
+  arrange(go_group, p.adjust) |> 
+  group_by(go_group,Cluster) |> 
+  slice_head(n=15) |> 
+  ungroup() |> 
+  ggplot(aes(
+    y = fct_reorder(Description, -log10(p.adjust)),
+    x = group,
+    color = -log10(pvalue),
+    size = Count
+  )) +
+  geom_point() +
+  theme_pubr() +
+  theme(legend.position = "right") +
+  rotate_x_text(angle = 45) +
+  facet_grid(go_group ~ direction, scales = "free",space = "free") +
+  scale_color_gradient(low="#feb7d2",high = "#870234")+
+  theme(strip.text.y = element_text(face = "bold.italic",angle = 0),
+        strip.text.x = element_text(face = "bold.italic"),
+        plot.title = element_text(face = "bold.italic"),
+        plot.subtitle = element_text(face = "italic")) +
+  labs(
+    x = "",
+    y = "",
+    color = expression("Log"[10]*"(p-value)"),
+    size = "Count",
+    title = "DotPlot of Enriched Terms",
+    subtitle = "Direction refers to state of high adiposity infants"
+  )
+```
+
+
+## Final Thoughts
+
+- Common neutrophil activation (MPO/defensins), a loss of placental immune tolerance (HLA-G) in both groups, and upregulation of insulin growth factor signaling.
+
+- Lean mothers with high adiposity infants have a downregulation of adaptive response pathways and cytotoxic gene sets. Obese mothers appear to have an upregulation of adaptive immune response and cytotoxic genes, suggesting a proinflammatory state.
+
+- High adiposity infants in lean mothers may be in a more permissive immunological environment (reduced T cell activation/chemotaxis, and expression of cytotoxic genes), with adipocyte differentiation remaining in a steady state and insulin growth factor signaling being upregulated.
+
+- Together these results show that neonatal adiposity in lean mothers is driven by a more immune permissive state allowing for nutrient driven adiposity, while increased fetal adiposity in obese mothers is driven by a proinflammatory state that upregulates adipocyte differentiation and insulin growth factor signaling.
+
+## Save Data
+
+```{r}
+saveRDS(se_filt, "../../results/v2_results/se_filt.rds")
+saveRDS(deg_df, "../../results/v2_results/deg_df.rds")
+saveRDS(enrich_res_mapped, "../../results/v2_results/enrich_res_mapped.rds")
+saveRDS(deg_lst, "../../results/v2_results/deg_lst.rds")
+
+```
+

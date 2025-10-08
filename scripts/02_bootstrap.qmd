@@ -1,0 +1,1656 @@
+---
+title: "Infant Adiposity Differential Expression Analysis"
+subtitle: "Bootstrapping Analysis"
+author: "Jason Laird"
+date: today
+date-format: short
+engine: knitr
+execute: 
+  warning: false
+  message: false
+  cache: true
+format: 
+  html:
+    toc: true
+    toc-float: true
+    toc-location: left
+    code-fold: true
+    embed-resources: true
+    theme: 
+      - simplex
+      - custom.scss
+    fontcolor: '#0c051a'
+---
+
+## Setup 
+
+### Libraries and Scripts Required
+
+```{r,warning=FALSE, message=FALSE}
+#| warning: false
+#| message: false
+
+library(tidyverse)
+library(tidybulk)
+library(openxlsx)
+library(janitor)
+library(ggpubr)
+library(ggvenn)
+library(scales)
+library(patchwork)
+library(UpSetR)
+library(SummarizedExperiment)
+library(clusterProfiler)
+library(enrichplot)
+library(EnhancedVolcano)
+library(biomaRt)
+library(factoextra)
+library(FactoMineR)
+library(sva)
+library(GEOquery)
+library(DESeq2)
+library(edgeR)
+library(DEGreport)
+library(impute)
+library(ggsci)
+library(ggpubr)
+library(pheatmap)
+library(grid)
+library(ggraph)
+library(tidygraph)
+
+invisible(lapply(list.files(path = "./",pattern = ".R",full.names = T),source))
+
+```
+
+### Helper Functions
+
+```{r}
+.get_pairwise_overlaps <- function(sets) {
+  # credit for most of the code:
+  # https://blog.jdblischak.com/posts/pairwise-overlaps/
+  # Ensure that all sets are unique character vectors
+  sets_are_vectors <- vapply(sets, is.vector, logical(1))
+  if (any(!sets_are_vectors)) {
+    stop("Sets must be vectors")
+  }
+  sets_are_atomic <- vapply(sets, is.atomic, logical(1))
+  if (any(!sets_are_atomic)) {
+    stop("Sets must be atomic vectors, i.e. not lists")
+  }
+  sets <- lapply(sets, as.character)
+  is_unique <- function(x) length(unique(x)) == length(x)
+  sets_are_unique <- vapply(sets, is_unique, logical(1))
+  if (any(!sets_are_unique)) {
+    stop("Sets must be unique, i.e. no duplicated elements")
+  }
+
+  n_sets <- length(sets)
+  set_names <- names(sets)
+  n_overlaps <- choose(n = n_sets, k = 2)
+
+  vec_name1 <- character(length = n_overlaps)
+  vec_name2 <- character(length = n_overlaps)
+  vec_num_shared <- integer(length = n_overlaps)
+  vec_overlap <- numeric(length = n_overlaps)
+  vec_jaccard <- numeric(length = n_overlaps)
+  vec_shared_terms <- character(length = n_overlaps)
+  overlaps_index <- 1
+
+  for (i in seq_len(n_sets - 1)) {
+    name1 <- set_names[i]
+    set1 <- sets[[i]]
+    for (j in seq(i + 1, n_sets)) {
+      name2 <- set_names[j]
+      set2 <- sets[[j]]
+
+      shared_terms <- paste(Reduce(intersect,list(set1,set2)),collapse = ",")
+
+      set_intersect <- set1[match(set2, set1, 0L)]
+      set_union <- .Internal(unique(c(set1, set2), incomparables = FALSE,
+                                    fromLast = FALSE, nmax = NA))
+      num_shared <- length(set_intersect)
+      overlap <- num_shared / min(length(set1), length(set2))
+      jaccard <- num_shared / length(set_union)
+
+      vec_name1[overlaps_index] <- name1
+      vec_name2[overlaps_index] <- name2
+      vec_num_shared[overlaps_index] <- num_shared
+      vec_overlap[overlaps_index] <- overlap
+      vec_jaccard[overlaps_index] <- jaccard
+      vec_shared_terms[overlaps_index] <- shared_terms
+
+      overlaps_index <- overlaps_index + 1
+    }
+  }
+
+  result <- data.frame(source = vec_name1,
+                       target = vec_name2,
+                       num_shared = vec_num_shared,
+                       overlap = vec_overlap,
+                       jaccard = vec_jaccard,
+                       shared_terms = vec_shared_terms,
+                       stringsAsFactors = FALSE)
+  return(result)
+}
+
+.cluster_mat <- function(
+    data_matrix,
+    dist_method = NULL,
+    cluster_method = "ward.D",
+    clustering_approach = "gap",
+    gap_stat_k_max = 20,
+    gap_stat_B = 50,
+    density_quantile = 0.90) {
+
+  # Determine appropriate distance metric
+  if (is.null(dist_method)) {
+    if (all(sapply(data_matrix, is.numeric))) {
+      dist_method <- "euclidean"
+    } else {
+      dist_method <- "gower"
+    }
+  }
+
+  # Compute distance matrix
+  sample_dist <- if (dist_method == "gower") {
+    cluster::daisy(data_matrix, metric = "gower")
+  } else {
+    dist(data_matrix, method = dist_method)
+  }
+
+  # Function to determine optimal k based on the selected clustering approach
+  determine_k <- function(dist_matrix, cluster_method) {
+    if (clustering_approach == "diana") {
+
+      # Determine optimal k using the height difference method
+      sample_cluster <- cluster::diana(as.dist(dist_matrix))
+      height_diffs <- diff(sample_cluster$height)
+      cutoff_index <- which.max(height_diffs)
+      return(length(sample_cluster$height) - cutoff_index)
+
+    } else if (clustering_approach == "gap") {
+
+      # Determine optimal k using the gap statistic
+      gap_stat <- cluster::clusGap(as.matrix(dist_matrix), FUN = hcut, K.max = gap_stat_k_max, B = gap_stat_B)
+      return(cluster::maxSE(gap_stat$Tab[, "gap"], gap_stat$Tab[, "SE.sim"]))
+
+    } else if (clustering_approach == "elbow") {
+
+      # Determine optimal k using the elbow method
+      wss_plot <- factoextra::fviz_nbclust(as.matrix(dist_matrix), FUN = hcut, method = "wss")
+
+      # Identify the first significant drop and ensure it's a number we can use
+      k_optimal <- which.min(diff(diff(wss_plot$data$y))) + 1
+      if (is.na(k_optimal) || k_optimal < 2) k_optimal <- 3
+      return(k_optimal)
+
+    } else if (clustering_approach == "dynamic") {
+
+    # Determine optimal k using dynamic tree cut
+     sample_cluster <- hclust(as.dist(dist_matrix), method = cluster_method)
+      cut_clusters <- dynamicTreeCut::cutreeDynamic(
+        dendro = sample_cluster,
+        distM = as.matrix(as.dist(dist_matrix)),
+        deepSplit = 2)
+      return(length(unique(cut_clusters)))
+
+    } else if (clustering_approach == "density") {
+      # Determine optimal k using density-based clustering
+      dclust <- densityClust::densityClust(as.dist(dist_matrix), gaussian = TRUE)
+      dclust <- densityClust::findClusters(dclust, rho = quantile(dclust$rho, density_quantile), delta = quantile(dclust$delta, density_quantile))
+      return(length(unique(dclust$clusters)))
+
+    } else {
+      stop("Invalid clustering approach selected.")
+    }
+  }
+
+  k_samples <- determine_k(sample_dist, cluster_method)
+
+  # Perform hierarchical clustering only if needed
+  sample_cluster <- hclust(as.dist(sample_dist), method = cluster_method)
+
+  # Cut dendrograms using optimal k values
+  sample_groups <- cutree(sample_cluster, k = k_samples)
+
+  message("Optimal number of clusters for samples: ", k_samples)
+
+  return(sample_groups)
+}
+```
+
+### Import Data
+
+```{r}
+se_filt <- readRDS("../../results/v2_results/se_filt.rds")
+```
+
+## Filters
+
+- Outliers removed: "s34", "s459", "s29", "s72", "s307", "s349"
+
+- nominal p-value < 0.05 & abs(log2FoldChange) > log2(1.5)
+
+## Differential Expression Analysis
+
+Here we bootstrap our samples and re-run differential expression analysis 100 times. The model is as follows:
+
+Gene Expression ~ Fetal Adiposity + Child Biological Sex
+
+We run this analysis separately in lean and obese mothers. The results are then summarized to identify robust differentially expressed genes (DEGs) across the bootstrap runs.
+
+### Lean Mothers + Sex Adjustment
+
+```{r,warning=FALSE, message=FALSE,eval=FALSE}
+# boostrap the samples 
+# perform differential expression using DESeq2
+lean_res <- lapply(1:100, function(i) {
+  # sample the columns of the SummarizedExperiment object
+  samples <- sample(colnames(se_filt),
+                    size=length(colnames(se_filt)),
+                    replace=TRUE)
+  
+  # subset the SummarizedExperiment object to the sampled columns
+  se_tmp <- se_filt[,samples]
+  
+  # perform differential expression using DESeq2
+  res <- se_tmp |> 
+    (\(se) {se = se[,grepl("Lean",se$mfadip)];se})() |> 
+    (\(se) {se$mfadip = factor(
+      se$mfadip,
+      levels=c("Lean_LA","Lean_HA"));se})() |> 
+    test_differential_abundance( ~ mfadip + gender,
+                                 method="deseq2",
+                                 fitType="local",
+                                 action="get") |>
+    as.data.frame() |> 
+    mutate(direction = ifelse( log2FoldChange > 0,"Up","Down")) |>
+    rownames_to_column("gene") |> 
+    mutate(boot_iteration=paste0("run_",i))
+}) |> 
+  bind_rows()
+  
+
+
+
+```
+
+### Obese Mothers + Sex Adjustment
+
+```{r,warning=FALSE, message=FALSE, eval= FALSE}
+# bootstrap the samples
+# perform differential expression using DESeq2
+obese_res <- lapply(1:100, function(i) {
+  # sample the columns of the SummarizedExperiment object
+  samples <- sample(colnames(se_filt),
+                    size=length(colnames(se_filt)),
+                    replace=TRUE)
+  
+  # subset the SummarizedExperiment object to the sampled columns
+  se_tmp <- se_filt[,samples]
+  
+  # perform differential expression using DESeq2
+  res <- se_tmp |> 
+    (\(se) {se = se[,grepl("Obese",se$mfadip)];se})() |> 
+    (\(se) {se$mfadip = factor(
+      se$mfadip,
+      levels=c("Obese_LA","Obese_HA"));se})() |> 
+    test_differential_abundance( ~ mfadip + gender,
+                                 method="deseq2",
+                                 fitType="local",
+                                 action="get") |>
+    as.data.frame() |> 
+    mutate(direction = ifelse( log2FoldChange > 0,"Up","Down")) |>
+    rownames_to_column("gene") |> 
+    mutate(boot_iteration=paste0("run_",i))
+}) |> 
+  bind_rows()
+
+
+```
+
+## Save Results
+
+```{r}
+#| eval: false
+# Save the results to RDS files
+saveRDS(lean_res, "../../results/v2_results/bootstrapped_lean_mothers.rds")
+saveRDS(obese_res, "../../results/v2_results/bootstrapped_obese_mothers.rds")
+
+```
+
+## Bootstrap Results
+
+```{r}
+# Load the bootstrapped results
+lean_res <- readRDS("../../results/v2_results/bootstrapped_lean_mothers.rds")
+obese_res <- readRDS("../../results/v2_results/bootstrapped_obese_mothers.rds")
+
+```
+
+
+### Lean Mothers
+
+```{r}
+#| fig-width: 6
+#| fig-height: 5
+
+
+# Count number of bootstrap runs
+n_boot <- lean_res |> 
+  pull(boot_iteration) |> 
+  unique() |> 
+  length()
+
+# Identify robust DEGs in lean_res
+lean_degs_summary <- lean_res |>
+  filter(!is.na(pvalue), 
+         pvalue < 0.05,
+         abs(log2FoldChange) > log2(1.5)) |>
+  mutate(sign = sign(log2FoldChange)) |>
+  group_by(gene) |>
+  summarise(
+    freq = n() / n_boot,
+    sign_consistency = abs(mean(sign)),
+    median_log2FC = median(log2FoldChange, na.rm = TRUE),
+    median_pvalue = median(pvalue, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(freq >= 0.5,
+         sign_consistency >= 0.5)
+
+lean_degs_summary |> 
+  arrange(desc(freq)) |>
+  mutate(to_label=ifelse(freq >= 0.8, gene, NA)) |>
+  ggplot(aes(
+    x = median_log2FC,
+    y = -log10(median_pvalue), 
+    color = freq)) +
+    geom_point() +
+    scale_color_gradient(
+      low = "gray75", 
+      high = "magenta4") +
+    geom_vline(xintercept = c(-log2(1), log2(1)),
+               linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05),
+               linetype = "dashed")+
+    geom_label_repel(aes(label = to_label),
+                    size = 3,
+                    max.overlaps = 20,
+                    nudge_x = 0.1,
+                    nudge_y = 0.1,
+                    fontface = "italic") +
+  theme_minimal()+
+  theme(plot.title = element_text(face = "bold.italic"))+
+  labs(
+    x = expression("Median Log"[2]*"FC"),
+    y = expression("-Log"[10]*"Median P-value"),
+    color = "Frequency",
+    title= "Frequency of DEGs in Lean Mothers") 
+```
+
+### Obese Mothers
+
+```{r}
+#| fig-width: 6
+#| fig-height: 5
+
+# Count number of bootstrap runs
+n_boot <- obese_res |> 
+  pull(boot_iteration) |> 
+  unique() |> 
+  length()
+
+# Identify robust DEGs in lean_res
+obese_degs_summary <- obese_res |>
+  filter(!is.na(pvalue), 
+         pvalue < 0.05,
+         abs(log2FoldChange) > log2(1.5)) |>
+  mutate(sign = sign(log2FoldChange)) |>
+  group_by(gene) |>
+  summarise(
+    freq = n() / n_boot,
+    sign_consistency = abs(mean(sign)),
+    median_log2FC = median(log2FoldChange, na.rm = TRUE),
+    median_pvalue = median(pvalue, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  filter(freq >= 0.5,
+         sign_consistency >= 0.5)
+
+obese_degs_summary |>
+  arrange(desc(freq)) |>
+  mutate(to_label=ifelse(freq >= 0.8, gene, NA)) |>
+  ggplot(aes(
+    x = median_log2FC,
+    y = -log10(median_pvalue), 
+    color = freq)) +
+    geom_point() +
+    scale_color_gradient(
+      low = "gray75", 
+      high = "magenta4") +
+    geom_vline(xintercept = c(-log2(1), log2(1)),
+               linetype = "dashed") +
+    geom_hline(yintercept = -log10(0.05),
+               linetype = "dashed")+
+    geom_label_repel(aes(label = to_label),
+                    size = 3,
+                    max.overlaps = 20,
+                    nudge_x = 0.1,
+                    nudge_y = 0.1,
+                    fontface = "italic") +
+  theme_minimal()+
+  theme(plot.title = element_text(face = "bold.italic")
+        )+
+  labs(
+    x = expression("Median Log"[2]*"FC"),
+    y = expression("-Log"[10]*"Median P-value"),
+    color = "Frequency",
+    title= "Frequency of DEGs in Obese Mothers")
+```
+
+## Intersection of DEGs
+
+```{r}
+#| fig-width: 6
+#| fig-height: 5
+
+# Identify DEGs in lean and obese mothers
+common_robust_degs <- intersect(
+  lean_degs_summary$gene, 
+  obese_degs_summary$gene)
+
+# identify if the DEGs are up or down regulated in each group
+common_robust_summary <- lean_degs_summary |>
+  mutate(direction_lean = ifelse(
+    median_log2FC > 0, "Up", "Down")) |> 
+  dplyr::select(gene, direction_lean) |>
+  inner_join(obese_degs_summary |>
+    mutate(direction_obese = ifelse(
+      median_log2FC > 0, "Up", "Down")) |> 
+      dplyr::select(gene, direction_obese),
+    by = "gene"
+  ) |> 
+  mutate(concordance= ifelse(
+    direction_lean == direction_obese, 
+    "Concordant", "Discordant")) 
+
+DT::datatable(common_robust_summary, 
+              options = list(pageLength = 10, 
+                             autoWidth = TRUE),
+              rownames = FALSE
+              ) 
+```
+
+### Venn Diagram
+
+```{r}
+#| fig-width: 6
+#| fig-height: 4
+#| warning: false
+#| message: false
+
+list(
+      Lean = lean_degs_summary$gene,
+      Obese = obese_degs_summary$gene
+    ) |> 
+ ggvenn(
+    stroke_color = "transparent",
+    fill_alpha = 0.5
+  )+
+  coord_cartesian(clip="off")+
+  scale_fill_manual(values = c("#DDF1F5", "#C195C4"))
+
+```
+
+### Heatmap
+
+```{r}
+#| fig-width: 4
+#| fig-height: 6
+#| warning: false
+#| message: false
+
+
+lean_degs_summary |> 
+    rename(fc = median_log2FC) |> 
+    mutate(group = "Lean") |> 
+    dplyr::select(gene, fc, group) |> 
+    bind_rows(
+        obese_degs_summary |> 
+            rename(fc = median_log2FC) |> 
+            mutate(group = "Obese") |> 
+            dplyr::select(gene, fc, group)
+    ) |>
+    filter(gene %in% common_robust_degs) |>
+    group_by(gene) |> 
+    mutate(concordant = ifelse(
+        gene %in% common_robust_summary$gene[
+            common_robust_summary$concordance == "Concordant"],
+        "Concordant",
+        "Discordant"
+    )) |>
+    ungroup() |>
+    
+    # calculate average |log2FC| across groups for sorting
+    group_by(gene, concordant) |>
+    summarise(avg_abs_fc = mean(abs(fc)), .groups = "drop") |>
+    arrange(concordant, desc(avg_abs_fc)) |>
+    mutate(gene_ordered = factor(gene, levels = unique(gene))) |>
+    
+    # Join back to full data to plot
+    right_join(
+        lean_degs_summary |> 
+            rename(fc = median_log2FC) |> 
+            mutate(group = "Lean") |> 
+            dplyr::select(gene, fc, group) |> 
+            bind_rows(
+                obese_degs_summary |> 
+                    rename(fc = median_log2FC) |> 
+                    mutate(group = "Obese") |> 
+                    dplyr::select(gene, fc, group)
+            ) |>
+            filter(gene %in% common_robust_degs) |>
+            group_by(gene) |> 
+            mutate(concordant = ifelse(
+                gene %in% common_robust_summary$gene[
+                    common_robust_summary$concordance == "Concordant"],
+                "Concordant",
+                "Discordant"
+            )) |>
+            ungroup(),
+        by = c("gene", "concordant")
+    ) |> ggplot(aes(
+        x = group, 
+        y = gene_ordered, 
+        fill = fc)) +
+    geom_tile() +
+    scale_fill_gradient2(
+        low = "blue4", 
+        mid = "white", 
+        high = "red4", 
+        midpoint = 0,
+        name = "Median LogFC") +
+    labs(
+        x = "",
+        y = "",
+        title = "Heatmap of Robust DEGs"
+    ) +
+    theme_pubr() +
+    facet_grid(~group, scales = "free", space = "free") +
+    theme(
+        axis.text.y = element_text(angle = 0, hjust = 1, face = "italic"),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        strip.text.x = element_text(angle = 0, face = "bold.italic", size = 14),
+        strip.text.y = element_text(face = "bold.italic"),
+        legend.position = "right",
+        plot.title = element_text(face = "bold.italic"),
+        strip.background = element_rect(fill = "transparent",
+                                        colour = "transparent")
+    )
+```
+
+
+
+## Enrichment Analysis
+
+```{r,warning=FALSE,message=FALSE}
+
+deg_df <- lean_degs_summary |> 
+  mutate(direction = ifelse(
+    median_log2FC > 0, "Up", "Down")) |> 
+  mutate(group = "Lean") |> 
+  dplyr::select(gene,
+                direction,
+                group) |> 
+  bind_rows(
+    obese_degs_summary |> 
+      mutate(direction = ifelse(
+        median_log2FC > 0, "Up", "Down")) |> 
+      mutate(group = "Obese") |> 
+      dplyr::select(gene, 
+                    direction, 
+                    group)
+  )
+
+
+enrich_res <- compareCluster(
+        gene~direction+group,
+        data = deg_df,
+        fun = "enrichGO",
+        OrgDb = 'org.Hs.eg.db',
+        keyType = "SYMBOL",
+        ont = "BP",
+        universe = rownames(se_filt),
+        pAdjustMethod = "fdr",
+        pvalueCutoff = 0.1,
+        qvalueCutoff = 0.1
+      )
+
+# overlaps <- .get_pairwise_overlaps(
+#   sets = enrich_res@compareClusterResult |> 
+#     filter(p.adjust < 0.1) |> 
+#     (\(df) split(df,df$Description))() |> 
+#     map(~ .x |> 
+#           pull(geneID) |> 
+#           strsplit(split = "/") |> 
+#           unlist() |> 
+#           unique()
+#     )
+# )
+
+groups <- cluster_go_terms(enrich_res@compareClusterResult |> 
+    filter(p.adjust < 0.1) |> 
+    (\(df) split(df,df$Description))() |> 
+    map(~ .x |> 
+            pull(geneID) |> 
+            strsplit(split = "/") |> 
+            unlist() |> 
+            unique()
+    ),
+    
+  link = "average",
+  cut = "dynamic",
+  minClusterSize = 5)
+
+# overlap_mat <- overlaps |> 
+#   dplyr::select(source,target,jaccard) |> 
+#   pivot_wider(
+#     names_from = target,
+#     values_from = jaccard,
+#     values_fill = 0
+#   ) |> 
+#   column_to_rownames("source") |> 
+#   as.matrix()
+
+# groups <- .cluster_mat(
+#   overlap_mat,
+#   clustering_approach = "diana") |> 
+#   as.data.frame() |> 
+#   setNames("go_group") |>
+#   rownames_to_column("Description")
+
+
+enrich_res_mapped <- enrich_res |> 
+  pluck("compareClusterResult") |> 
+  left_join(groups, by = "Description") |> 
+  # make a group if na
+  # mutate(go_group = ifelse(
+  #   is.na(go_group),
+  #   max(go_group,na.rm = T)+1,
+  #   go_group)) |>
+  mutate(go_group=paste("Group",cluster,sep=" "))  
+```
+
+### DotPlot
+
+```{r}
+#| fig-width: 10
+#| fig-height: 6
+#| warning: false
+#| message: false
+
+enrich_res_mapped |> 
+  filter(p.adjust < 0.1) |> 
+  mutate(Description = fct_reorder(Description, group)) |> 
+  ggplot(aes(
+    x = Description, 
+    y = group, 
+    size = Count, 
+    color = -log10(p.adjust))) +
+    geom_point() +
+    scale_color_gradient(
+      low = "thistle", 
+      high = "#370438"
+    )+
+    coord_flip() +
+    labs(
+      x = "",
+      y = "",
+      size = "Count",
+      color = expression("-Log"[10]*"Adjusted P")
+    ) +
+    theme_pubclean() +
+  scale_size_continuous(range = c(2, 6)) +
+    theme(legend.position = "right",
+          strip.text.y = element_text(
+            angle=0,
+            face = "bold.italic"),
+          strip.text.x = element_text(
+            face = "bold.italic"),
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank())+
+  facet_grid(go_group~group, scales = "free",space = "free")
+```
+
+### GO Term Heatmap
+
+```{r}
+#| fig-width: 14
+#| fig-height: 6
+#| warning: false
+#| message: false
+
+
+enrich_res_mapped |> 
+  group_by(go_group) |> 
+  arrange(p.adjust) |>
+  slice_head(n=5) |> 
+  separate_rows(geneID,sep="/") |>
+  inner_join(
+    lean_degs_summary |> 
+    dplyr::rename(fc=median_log2FC) |> 
+    mutate(group = "Lean") |> 
+    dplyr::select(gene,
+                  fc,
+                  group) |> 
+    bind_rows(
+        obese_degs_summary |> 
+            dplyr::rename(fc=median_log2FC) |> 
+            mutate(group = "Obese") |> 
+            dplyr::select(gene, 
+                          fc, 
+                          group)
+    ),
+    by=c("group",
+         "geneID"="gene")
+  ) |> 
+  #mutate(Description = fct_reorder2(Description, fc, go_group)) |>
+  mutate(Description = fct_reorder2(Description, abs(fc), geneID)) |> 
+  ggplot(aes(
+    x = geneID, 
+    y = Description, 
+    fill = fc)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "blue4", 
+      mid = "white", 
+      high = "red4", 
+      midpoint = 0,
+      limits = c(-3, 3),
+      name = "Median LogFC") +
+    labs(
+      x = "",
+      y = "",
+      title = "Heatmap of DEGs in Enriched GO Terms"
+    ) +
+    theme_pubr() +
+  facet_grid(go_group~group, scales = "free",space = "free") +
+    theme(axis.text.x = element_text(angle=90, 
+                                     hjust=1,
+                                     face = "italic"),
+          axis.ticks.x = element_blank(),
+          strip.text.y = element_text(
+            angle=0,
+            face = "bold.italic",size = 16),
+          strip.text.x = element_text(
+            face = "bold.italic",size = 16),
+          legend.position="bottom",
+          plot.title = element_text(face = "bold.italic")
+  )
+  
+```
+
+### Common DEG GO Term Heatmap
+
+```{r}
+#| fig-width: 7.5
+#| fig-height: 6
+#| warning: false
+#| message: false
+
+enrich_res_mapped |> 
+  separate_rows(geneID,sep="/") |>
+  inner_join(
+    lean_degs_summary |> 
+    dplyr::rename(fc=median_log2FC) |> 
+    mutate(group = "Lean") |> 
+    dplyr::select(gene,
+                  fc,
+                  group) |> 
+    bind_rows(
+        obese_degs_summary |> 
+            dplyr::rename(fc=median_log2FC) |> 
+            mutate(group = "Obese") |> 
+            dplyr::select(gene, 
+                          fc, 
+                          group)
+    ),
+    by=c("group",
+         "geneID"="gene")
+  ) |> 
+  filter(geneID %in% common_robust_degs) |>
+  mutate(Description = fct_reorder2(Description, abs(fc), geneID)) |> 
+  ggplot(aes(
+    x = geneID, 
+    y = Description, 
+    fill = fc)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "blue4", 
+      mid = "white", 
+      high = "red4", 
+      midpoint = 0,
+      limits = c(-3, 3),
+      name = "Median Fold Change") +
+    labs(
+      x = "",
+      y = "",
+      title = "Heatmap of DEGs in Enriched GO Terms",
+      subtitle = "Common DEGs"
+    ) +
+    theme_pubclean() +
+  facet_grid(go_group~group, scales = "free",space = "free") +
+    theme(axis.text.x = element_text(angle=90, 
+                                     hjust=1,
+                                     face = "italic"),
+          axis.ticks.x = element_blank(),
+          strip.text.y = element_text(
+            angle=0,
+            face = "bold.italic"),
+          strip.text.x = element_text(
+            face = "bold.italic"),
+          legend.position="bottom",
+          plot.title = element_text(face = "bold.italic"),
+          plot.subtitle = element_text(face = "italic")
+  )
+```
+
+## Placental Expression
+
+### CNAAG
+
+```{r,fig.width=10,fig.height=8}
+# bring in placental reference data
+# clean data so that the cell types are in one column rather than headers
+# add a column for source info
+# swap short names for long cell type names
+# select certain columns for plotting
+# downloaded from:
+# https://www.ncbi.nlm.nih.gov/pmc/articles/PMC5340963/bin/supp_gr.207597.116_Supplemental_Tables.xlsx
+
+placenta <- openxlsx::read.xlsx(
+  xlsxFile="../../data/pavlicev_2017_plancenta_reference.xlsx",
+  sheet = "S1",
+  startRow = 4) |>
+  dplyr::select(-SE) |>
+  pivot_longer(!Gene, 
+               names_to = "Cell type",
+               values_to = "nTPM") |>
+  rename("Gene name"="Gene") |>
+  mutate(log2_exp = log2(nTPM+1)) |>
+  mutate(tissue="Placenta") |> 
+  filter(`Gene name` %in% common_robust_degs) |>
+  dplyr::select(
+    `Gene name`,`Cell type`,log2_exp,tissue
+  ) |> 
+  mutate(
+    `Cell type`=stringi::stri_replace_all_regex(
+      `Cell type`,
+      pattern=c("CYT1" ,"CYT2" ,"CYT3" ,"DC"   ,"EVT"  ,"SYN" ,"ESF"  ,"DEC"),
+      replacement = c("Intravillous cytotrophoblast 1",
+                      "Intravillous cytotrophoblast 2",
+                      "Intravillous cytotrophoblast 3",
+                      "Dendritic Cell",
+                      "Extravillous Trophoblast",
+                      "Syncytiotrophoblast",
+                      "Endometrial Stromal Fibroblast",
+                      "Decidual Cell"),
+      vectorize_all = FALSE
+    )
+  )
+
+# convert counts to log2 exp so we can compare the two references on the same scale
+# add a column for source info
+# select certain columns for plotting
+hpa_immune = read_tsv(
+  "../../data/rna_immune_cell.tsv"
+) |>
+  mutate(log2_exp = log2(nTPM+1)) |>
+  mutate(tissue="Human Protein Atlas - Immune") |>
+  rename("Cell type"="Immune cell") |>
+  filter(`Gene name` %in% common_robust_degs) |>
+  dplyr::select(
+    `Gene name`,`Cell type`,log2_exp,tissue
+  ) 
+
+# rank gene expression by placental reference
+placenta_rank = placenta |>
+  group_by(`Gene name`) |>
+  summarise(placenta_rank=mean(log2_exp))
+
+# merge two sources into one df for plotting
+placenta_hpa_immune <- rbind(placenta,hpa_immune) |>
+  filter(`Gene name` %in% common_robust_degs) |>
+  inner_join(placenta |>
+               group_by(`Gene name`) |>
+               summarise(placenta_rank=mean(log2_exp)),
+             by=c("Gene name"="Gene name")) 
+
+# plot the expression of common adiposity drivers in both
+# placental reference data and the hpa immune cell reference
+placenta_hpa_immune |>
+  ggplot(aes(
+    x=reorder(`Cell type`,log2_exp),
+    y=reorder(`Gene name`,placenta_rank),
+    size=log2_exp,
+    color=tissue
+  ))+
+  geom_point()+
+  theme_pubr(legend = "right")+
+  scale_color_manual(values=c(
+    "Human Protein Atlas - Immune"="#7A2314",
+    "Placenta"="#8181A1"
+  ))+
+  guides(color="none")+
+  scale_size(range=c(.1,10))+
+  rotate_x_text(angle=45)+
+  facet_grid(.~tissue,
+             scales = "free",
+             space="free")+
+  theme(strip.text.x.top = element_text(face = "bold.italic",
+                                        size = 12),
+        axis.text.y = element_text(face = "italic"))+
+  labs(
+    x="",
+    y="",
+    size=expression(Log[2]~"(TPM + 1)"),
+  )
+```
+
+## Common CNAAG Expression
+
+```{r,warning=FALSE,message=FALSE}
+#| fig-width: 10
+#| fig-height: 5
+se_filt |> 
+  tidybulk() |> 
+  filter(.feature %in% c(
+    "ATP12A","C1orf127","DEFA1","DEFA1B",
+    "ELANE","IL20","PTX4","RND1","STK32A"
+  )) |> 
+  mutate(fadip=case_when(
+    fadip=="HA" ~ "High Adiposity",
+    fadip=="LA" ~ "Low Adiposity"
+  )) |> 
+  mutate(fadip=factor(fadip,levels=c(
+    "Low Adiposity","High Adiposity"
+  ))) |> 
+  ggplot(aes(
+    x=fadip,
+    y=log2(counts+1),
+    fill=fadip
+  ))+
+  geom_violin(trim=FALSE, alpha=0.5) +
+  geom_boxplot(width=0.1, outlier.shape = NA) +
+  theme_pubr(legend = "right") +
+  scale_fill_manual(values = c("#91D1C2FF", "#8491B4FF")) +
+  facet_grid(gender~.feature, 
+             scales = "free_y",
+             space = "free") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        strip.text = element_text(face = "bold.italic"))+
+  labs(
+    x="",
+    y=expression(Log[2]~"(Expression)"),
+    fill=""
+  )
+
+```
+
+### Save CNAAG Results
+
+```{r}
+library(biomaRt)
+
+# Connect to Ensembl BioMart
+# mart <- biomaRt::useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+# biomaRt::getBM(
+#   attributes = c("hgnc_symbol", "description","definition_1006"),
+#   filters    = "hgnc_symbol",
+#   values     = common_robust_degs,
+#   mart       = mart
+# ) |> 
+#   mutate(description=gsub("\\[Source.*","",description)) |> 
+#   dplyr::rename(gene=hgnc_symbol)  
+  
+# Query UniProt for Annotation
+common_robust_deg_mapped <- annotate_genes(
+  common_robust_degs
+) |> 
+  left_join(
+    lean_degs_summary |> 
+      dplyr::select(
+        "BMI < 25kg/m2 - HA v. LA Median Log2FC"= median_log2FC,
+        "BMI < 25kg/m2 - HA v. LA Median P-Value"=median_pvalue,
+        gene),
+    by=c("gene")) |> 
+  
+  left_join(
+    obese_degs_summary |> 
+      dplyr::select(
+        "BMI > 30kg/m2 - HA v. LA Median Log2FC"= median_log2FC,
+        "BMI > 30kg/m2 - HA v. LA Median P-Value"=median_pvalue,
+        gene),
+    by=c("gene")) |> 
+  dplyr::rename(
+    "Gene Symbol"=gene,
+    "Gene Name"=protein_name,
+    "Biological Process/Function"=go_bp
+  )
+
+
+wb <- createWorkbook()
+addWorksheet(wb, "CNAAG")
+
+# write data with bold header
+writeData(
+  wb, 1, common_robust_deg_mapped,
+  headerStyle = createStyle(textDecoration = "bold")
+)
+
+# italicize first column values
+italic_style <- createStyle(textDecoration = "italic")
+addStyle(
+  wb, style = italic_style,
+  rows = 2:(nrow(common_robust_deg_mapped)+1), cols = 1,
+  gridExpand = TRUE,sheet = "CNAAG"
+)
+
+# set width = length of header text (+ a little padding)
+headers <- colnames(common_robust_deg_mapped)
+widths <- nchar(headers) + 2
+setColWidths(wb, 1, cols = 1:length(headers), widths = widths)
+
+saveWorkbook(wb, "../../results/boot_res/cnaag_descriptions.xlsx", overwrite = TRUE)
+
+
+```
+
+## Common CNAAG STRING Plot
+
+```{r}
+#| fig-width: 5
+#| fig-height: 3
+# enrichment performed on 08/21/2025 
+# string v12
+cnaag_string <- read_tsv("../../results/boot_res/cnaag_string_interactions.tsv")
+
+cnaag_g <- cnaag_string |> 
+  dplyr::select(node1,node2,combined_score) |> 
+  as_tbl_graph() |> 
+  activate(nodes) |> 
+  mutate(Degree=tidygraph::centrality_degree()) |> 
+  left_join(lean_degs_summary, by = c("name" = "gene"))
+
+cnaag_g |>
+  ggraph(layout = "fr") +
+  geom_edge_link(
+    aes(width = combined_score),
+    alpha = 0.8,
+    color = "gray50"
+  ) +
+  scale_edge_width(range = c(0.2, 2), guide = "none") +
+  geom_node_point(aes(size = Degree),
+                  color="steelblue") +
+  geom_node_label(
+    aes(label = name),
+    repel = TRUE,
+    size = 3,
+    fontface = "italic"
+  ) +
+  theme_void()+
+  labs(title = "CNAAG STRING Network",
+       subtitle = "PPI enrichment p-value:	0.0114")+
+  theme(plot.title = element_text(face="bold.italic"),
+        plot.subtitle = element_text(face="italic"))
+```
+
+
+![](../../results/boot_res/common_cnaag.svg)
+
+*PPI enrichment p-value:	0.0114*
+
+## CNAAG Coexpression
+
+```{r}
+#| fig-width: 7
+#| fig-height: 7
+mat <- se_filt |>
+  tidybulk() |>
+  filter(.feature %in% common_robust_degs) |>
+  dplyr::select(.sample, .feature, counts) |>
+  tidyr::pivot_wider(names_from = .feature, values_from = counts) |>
+  tibble::column_to_rownames(".sample") |>
+  cor(method = "pearson", use = "pairwise.complete.obs")
+
+pheatmap(
+  mat,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  main = expression(bolditalic("CNAAG Co-expression")),
+  color = colorRampPalette(c("blue4", "white", "red4"))(200),
+  breaks = seq(-1, 1, length.out = 201),
+  labels_row = parse(text = paste0("italic('", rownames(mat), "')")),  
+  labels_col = parse(text = paste0("italic('", colnames(mat), "')"))   
+)
+  
+```
+## Lean NAAG
+
+### String Plot 
+
+```{r}
+#| fig-width: 7
+#| fig-height: 7
+# enrichment performed on 08/21/2025 
+# string v12
+lean_string <- read_tsv("../../results/boot_res/lean_naag_string_interactions.tsv")
+
+lean_g <- lean_string |> 
+  dplyr::select(node1,node2,combined_score) |> 
+  as_tbl_graph() |> 
+  activate(nodes) |> 
+  mutate(Degree=tidygraph::centrality_degree()) |> 
+  left_join(lean_degs_summary, by = c("name" = "gene"))
+
+lean_g |>
+  ggraph(layout = "fr") +
+  geom_edge_link(
+    aes(width = combined_score),
+    alpha = 0.8,
+    color = "gray50"
+  ) +
+  scale_edge_width(range = c(0.2, 2), guide = "none") +
+  geom_node_point(aes(size = Degree, color = median_log2FC)) +
+  geom_node_label(
+    aes(label = ifelse(Degree >= quantile(Degree, 0.9), name, "")),
+    repel = TRUE,
+    size = 3,
+    fontface = "italic"
+  ) +
+  scale_color_gradient2(
+    low = "blue4",
+    mid = "white",
+    high = "red4",
+    midpoint = 0
+  ) +
+  theme_void()+
+  labs(title = "Lean NAAG STRING Network",
+       subtitle = "PPI enrichment p-value:	2.78e-12",
+       color = expression("Median Log"[2]*"FC"))+
+  theme(plot.title = element_text(face="bold.italic"),
+        plot.subtitle = element_text(face="italic"))
+```
+
+### Correlation String 
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+
+lean_cors <- lean_string |>
+      mutate(pair = map2_chr(
+        node1, node2,
+        ~paste(sort(c(.x,.y)), collapse="_"))) |> 
+  left_join(
+    se_filt |>
+  tidybulk() |>
+  filter(.feature %in% lean_degs_summary$gene,
+         madip == "Lean") |>
+  dplyr::select(.sample, .feature, counts) |>
+  pivot_wider(names_from = .feature, values_from = counts) |>
+  column_to_rownames(".sample") |>
+  as.matrix() |>
+  (\(mat) {
+    rc <- Hmisc::rcorr(mat, type = "pearson")
+    tibble(
+      gene1 = rep(rownames(rc$r), times = ncol(rc$r)),
+      gene2 = rep(colnames(rc$r), each = nrow(rc$r)),
+      correlation = as.vector(rc$r),
+      p_value = as.vector(rc$P)
+    )
+  })() |>
+  mutate(padj=p.adjust(p_value,method="fdr")) |> 
+  # remove self correlations and duplicates
+  filter(gene1 < gene2,
+         abs(correlation) > 0.3,
+         p_value<0.05) |> 
+  mutate(pair = map2_chr(
+    gene1, gene2,
+    ~paste(sort(c(.x,.y)), collapse="_"))),
+  by="pair"
+  ) |> 
+  mutate(confirmed=ifelse(is.na(gene1),"dashed","solid")) 
+  #mutate(confirmed=as.factor(confirmed))
+
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 7
+# enrichment performed on 08/21/2025 
+# string v12
+lean_string <- read_tsv("../../results/boot_res/lean_naag_string_interactions.tsv")
+
+# lean_g_cor <- lean_string |> 
+#   dplyr::select(node1,node2,combined_score) |> 
+#   as_tbl_graph() |> 
+#   activate(nodes) |> 
+#   mutate(Degree=tidygraph::centrality_degree()) |> 
+#   left_join(lean_degs_summary, by = c("name" = "gene")) |> 
+#   left_join(
+#     data.frame(name=unique(c(lean_cors$gene1,
+#                         lean_cors$gene2)),
+#                cor_confirmed="cor_confirmed"),
+#                by="name")
+
+
+lean_g_cor <- lean_cors |> 
+  dplyr::select(node1,node2,combined_score,confirmed) |> 
+  as_tbl_graph() |> 
+  activate(nodes) |> 
+  mutate(Degree=tidygraph::centrality_degree()) |> 
+  left_join(lean_degs_summary, by = c("name" = "gene")) 
+
+lean_g_cor_p <- lean_cors |>
+  tabyl(confirmed) |>
+  filter(confirmed=="solid") |>
+  pull(percent) |>
+  round(digits = 3)*100
+
+lean_g_cor_total <- lean_cors |>
+  nrow()
+
+lean_g_cor_conf <- lean_cors |>
+  tabyl(confirmed) |>
+  filter(confirmed=="solid") |>
+  pull(n)
+
+lean_g_cor |>
+  ggraph(layout = "fr") +
+  geom_edge_link(
+    aes(width = combined_score,
+      linetype = confirmed),
+    alpha = 0.8,
+    color = "gray50"
+  ) +
+  scale_edge_linetype_identity()+
+  scale_edge_width(range = c(0.2, 2), guide = "none") +
+  geom_node_point(aes(size = Degree, color = median_log2FC)) +
+  geom_node_label(
+    aes(label = ifelse(Degree>=quantile(Degree,0.9), name, "")),
+    repel = TRUE,
+    size = 3,
+    fontface = "italic"
+  ) +
+  scale_color_gradient2(
+    low = "blue4",
+    mid = "white",
+    high = "red4",
+    midpoint = 0
+  ) +
+  theme_void()+
+  guides(edge_linetype = "none")+
+  labs(title = "Lean NAAG STRING Network",
+       subtitle = "PPI enrichment p-value:	2.78e-12",,
+       caption = paste(
+         lean_g_cor_conf,
+         "/",
+         lean_g_cor_total,
+         " (",
+         lean_g_cor_p,
+         " %)",
+         " Connections Confirmed",
+         sep=""),
+       color = expression("Median Log"[2]*"FC"))+
+  theme(plot.title = element_text(face="bold.italic"),
+        plot.subtitle = element_text(face="italic"))
+```
+
+### Heatmap
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+se_filt |>
+  tidybulk() |>
+  filter(.feature %in% lean_degs_summary$gene,
+         madip == "Lean") |>
+  dplyr::select(.sample, .feature, counts) |>
+  pivot_wider(names_from = .feature, values_from = counts) |>
+  column_to_rownames(".sample") |>
+  cor(method = "pearson", use = "pairwise.complete.obs") |>
+  (\(mat) {
+    # keep only genes with at least one strong correlation to another
+    keep <- apply(mat, 1, function(x) any(abs(x) >= 0.8 & abs(x) < 1))
+    mat[keep, keep, drop = FALSE]
+  })() |>
+  pheatmap(
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    clustering_method = "complete",
+    main = expression(bolditalic("Lean Mother NAAG Co-expression")),
+    color = colorRampPalette(c("blue4", "white", "red4"))(200),
+    breaks = seq(-1, 1, length.out = 201)  # force -1 to 1 scale
+  )
+```
+
+## Obese NAAG
+
+### STRING Plot 
+
+```{r}
+#| fig-width: 7
+#| fig-height: 7
+obese_string <- read_tsv("../../results/boot_res/obese_naag_string_interactions.tsv")
+
+obese_g <- obese_string |> 
+  dplyr::select(node1,node2,combined_score) |> 
+  as_tbl_graph() |> 
+  activate(nodes) |> 
+  mutate(Degree=tidygraph::centrality_degree()) |> 
+  left_join(obese_degs_summary, by = c("name" = "gene"))
+
+obese_g |>
+  ggraph(layout = "fr") +
+  geom_edge_link(
+    aes(width = combined_score),
+    alpha = 0.8,
+    color = "gray50"
+  ) +
+  scale_edge_width(range = c(0.2, 2), guide = "none") +
+  geom_node_point(aes(size = Degree, color = median_log2FC)) +
+  geom_node_label(
+    aes(label = ifelse(Degree >= quantile(Degree, 0.9), name, "")),
+    repel = TRUE,
+    size = 3,
+    fontface = "italic"
+  ) +
+  scale_color_gradient2(
+    low = "blue4",
+    mid = "white",
+    high = "red4",
+    midpoint = 0
+  ) +
+  theme_void()+
+  labs(title = "Obese NAAG STRING Network",
+       subtitle = "PPI enrichment p-value:	1.22e-15",
+       color = expression("Median Log"[2]*"FC"))+
+  theme(plot.title = element_text(face="bold.italic"),
+        plot.subtitle = element_text(face="italic"))
+```
+
+
+### Correlation String 
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+
+obese_cors <-  obese_string |>
+  mutate(pair = map2_chr(
+    node1, node2,
+    ~paste(sort(c(.x,.y)), collapse="_"))) |> 
+  left_join(
+    se_filt |>
+      tidybulk() |>
+      filter(.feature %in% obese_degs_summary$gene,
+             madip == "Obese") |>
+      dplyr::select(.sample, .feature, counts) |>
+      pivot_wider(names_from = .feature, values_from = counts) |>
+      column_to_rownames(".sample") |>
+      as.matrix() |>
+      (\(mat) {
+        rc <- Hmisc::rcorr(mat, type = "pearson")
+        tibble(
+          gene1 = rep(rownames(rc$r), times = ncol(rc$r)),
+          gene2 = rep(colnames(rc$r), each = nrow(rc$r)),
+          correlation = as.vector(rc$r),
+          p_value = as.vector(rc$P)
+        )
+      })() |>
+      # remove self correlations and duplicates
+      filter(gene1 < gene2,
+             abs(correlation) > 0.3,
+             p_value<0.05) |> 
+      mutate(pair = map2_chr(
+        gene1, gene2,
+        ~paste(sort(c(.x,.y)), collapse="_"))),
+    by = "pair"
+  ) |> 
+  mutate(confirmed=ifelse(is.na(gene1),"dashed","solid"))
+
+```
+
+```{r}
+#| fig-width: 7
+#| fig-height: 7
+# enrichment performed on 08/21/2025 
+# string v12
+
+obese_g_cor <- obese_cors |> 
+  dplyr::select(node1,node2,combined_score,confirmed) |> 
+  as_tbl_graph() |> 
+  activate(nodes) |> 
+  mutate(Degree=tidygraph::centrality_degree()) |> 
+  left_join(obese_degs_summary, by = c("name" = "gene")) 
+
+obese_g_cor_p <- obese_cors |>
+  tabyl(confirmed) |>
+  filter(confirmed=="solid") |>
+  pull(percent) |>
+  round(digits = 3)*100
+
+obese_g_cor_total <- obese_cors |>
+  nrow()
+
+obese_g_cor_conf <- obese_cors |>
+  tabyl(confirmed) |>
+  filter(confirmed=="solid") |>
+  pull(n)
+
+obese_g_cor |>
+  ggraph(layout = "fr") +
+  geom_edge_link(
+    aes(width = combined_score,
+        linetype = confirmed),
+    alpha = 0.8,
+    color = "gray50"
+  ) +
+  scale_edge_linetype_identity()+
+  scale_edge_width(range = c(0.2, 2), guide = "none") +
+  geom_node_point(aes(size = Degree, color = median_log2FC)) +
+  geom_node_label(
+    aes(label = ifelse(Degree>=quantile(Degree,0.9), name, "")),
+    repel = TRUE,
+    size = 3,
+    fontface = "italic"
+  ) +
+  scale_color_gradient2(
+    low = "blue4",
+    mid = "white",
+    high = "red4",
+    midpoint = 0
+  ) +
+  guides(edge_linetype="none")+
+  theme_void()+
+  labs(title = "Obese NAAG STRING Network",
+       subtitle = "PPI enrichment p-value:	1.22e-15",
+       caption = paste(
+         obese_g_cor_conf,
+         "/",
+         obese_g_cor_total,
+         " (",
+         obese_g_cor_p,
+         " %)",
+         " Connections Confirmed",
+         sep=""),
+       color = expression("Median Log"[2]*"FC"))+
+  theme(plot.title = element_text(face="bold.italic"),
+        plot.subtitle = element_text(face="italic"))
+```
+
+### Heatmap
+
+```{r}
+#| fig-width: 10
+#| fig-height: 10
+se_filt |>
+  tidybulk() |>
+  filter(.feature %in% obese_degs_summary$gene) |>
+  dplyr::select(.sample, .feature, counts) |>
+  pivot_wider(names_from = .feature, values_from = counts) |>
+  column_to_rownames(".sample") |>
+  cor(method = "pearson", use = "pairwise.complete.obs") |>
+  (\(mat) {
+    # keep only genes with at least one strong correlation to another
+    keep <- apply(mat, 1, function(x) any(abs(x) >= 0.8 & abs(x) < 1))
+    mat[keep, keep, drop = FALSE]
+  })() |>
+  pheatmap(
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    clustering_method = "complete",
+    main = expression(bolditalic("Obese Mother NAAG Co-expression")),
+    color = colorRampPalette(c("blue4", "white", "red4"))(200),
+    breaks = seq(-1, 1, length.out = 201)  # force -1 to 1 scale
+  )
+```
+## Placental Expression - Lean and Obese
+
+### Lean
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+plot_placenta_hpa_bar(
+     common_genes = lean_degs_summary$gene,placenta_file = "../../data/pavlicev_2017_plancenta_reference.xlsx",immune_file = "../../data/rna_immune_cell.tsv",title = "Lean NAAG Summed Expression",angle = 70)
+```
+
+### Obese
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+plot_placenta_hpa_bar(
+    common_genes = obese_degs_summary$gene,placenta_file = "../../data/pavlicev_2017_plancenta_reference.xlsx",immune_file = "../../data/rna_immune_cell.tsv",title = "Obese NAAG Summed Expression",angle = 70)
+```
+
+## PCR Results
+
+### Boxplot
+
+```{r}
+#| fig-width: 6
+#| fig-height: 3
+pcr <- read_csv("../../data/MPO expression data.csv")
+
+pcr_merged <- pcr |> 
+    filter(!is.na(`MPO Expression (QPCR)`)) |> 
+    mutate(madip=case_when(
+        grepl("lean|Lean",Group)~ "Lean",
+        grepl("obese|Obese",Group)~ "Obese"
+    )) |> 
+    mutate(fadip=case_when(
+        grepl("LA",Group)~ "Low Adiposity",
+        grepl("HA",Group)~ "High Adiposity"
+    )) |>
+  mutate(.sample=paste0("s",`Study id`)) |> 
+    dplyr::select(gender,madip,fadip,`MPO Expression (QPCR)`,`Elastase (QPCR)`,.sample) |> 
+    pivot_longer(-c(madip,gender,fadip,.sample),
+                 names_to = ".feature",
+                 values_to = "qpcr") |> 
+    mutate(.feature=gsub(
+      " Expression.*| \\(Q.*","",.feature)) |> 
+  mutate(fadip=factor(fadip,levels=c(
+    "Low Adiposity",
+    "High Adiposity"
+  ))) |> 
+  mutate(.feature=gsub("Elastase","ELANE",.feature)) |> 
+  inner_join(se_filt |> 
+               tidybulk() |> 
+               filter(.feature %in% c("ELANE","MPO")) |>
+               dplyr::select(.sample,.feature,counts) |>
+               mutate(log2_counts=log2(counts+1)),
+             by=c(".feature",".sample"))
+
+pcr_merged |> 
+  ggplot(aes(
+    x=fadip,
+    y=qpcr,
+    fill=fadip
+  ))+
+  geom_violin(trim=FALSE, alpha=0.5) +
+  geom_boxplot(width=0.1, outlier.shape = NA) +
+  geom_pwc(method = "wilcox.test",
+           y.position = 10.3)+
+  theme_pubr(legend = "right")+
+  facet_grid(~madip+.feature)+
+  scale_fill_manual(values=c("#91D1C2FF", "#8491B4FF"))+
+  labs(
+    x="",
+    y=expression("Expression (qPCR)"),
+    fill=""
+  )+
+  rotate_x_text(angle=45)+
+  theme(strip.text.x = element_text(face="bold.italic"),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+```
+
+### Correlation
+
+```{r}
+pcr_merged |> 
+    ggplot(aes(
+        x=qpcr,
+        y=log2_counts
+    ))+
+    geom_point()+
+    theme_pubr(legend = "right")+
+    facet_grid(~.feature,scales = "free")+
+    labs(
+        x="Expression (qPCR)",
+        y=expression("Log"[2]*"(Exp)"),
+        color=""
+    )+
+    rotate_x_text(angle=45)+
+    theme(strip.text.x = element_text(face="bold.italic"),
+          axis.text.x = element_blank(),
+          axis.ticks.x = element_blank())+
+    stat_cor(label.y = 7.5,method = "spearman")+
+  stat_smooth(method = "lm")
+```
+
+
+## Save Supplemetnal Data
+
+```{r}
+# Lean mother degs  
+write.csv(lean_degs_summary,file="./results/boot_res/lean_mother_degs.csv",quote = F)
+
+# Obese mother degs
+write.csv(obese_degs_summary,file="./results/boot_res/obese_mother_degs.csv",quote = F)
+
+# Enrichment results
+write.csv(enrich_res_mapped,file="./results/boot_res/enrich_res_mapped.csv",quote = F)
+```
+
+## Final Thoughts
+
+- Bootstrapped DEGs reveal that many genes are consistently differentially expressed across multiple iterations. Here we filter out DEGs that are not signficantly differentially expressed in at least **50% of the bootstrap runs**.
+
+- When we compare this list of **Lean DEGs (232)**, and **Obese DEGs (243)**, we find **18 common DEGs**. Of these,**9 are concordant** in direction of change (i.e. upregulated in both groups or downregulated in both groups), while the other 9 are discordant (i.e. upregulated in one group and downregulated in the other).
+
+- The GO enrichment analysis reveals that the genes in common are involved in innate immune activation. These genes are **ELANE, DEFA1, and DEFA1B**, which are all involved in **neutrophil function and innate immune response**. This suggests that the differences in adiposity between lean and obese mothers may be associated with differences in innate immune activation in the infant.
+
+- Additionally **IL20** is upregulated in high adiposity infants in Lean and Obese mothers, suggesting a potential role in inflammation and immune response regulation.
+
+- We note that genes involved in **T-cell chemotaxis**  are **upregulated** in high adiposity infants in Lean mothers. In obese mothers, we see that genes involved in **gonadotropin secretion** are **downregulated** in high adiposity infants. 
+
+
